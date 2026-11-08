@@ -106,8 +106,16 @@ jobs:
           gh release upload "$STAGING" "$RUNNER_TEMP/editor-preview-url-$V.txt" --clobber --repo "$GITHUB_REPOSITORY"
           echo "preview: $url"
 
+      - name: A Firebase folder (promote, rollback)
+        if: ${{ inputs.stage != 'preview' }}
+        # the firebase CLI refuses hosting commands outside a folder with a firebase.json; the site folder only exists for preview
+        run: |
+          mkdir -p "$RUNNER_TEMP/fb"
+          printf '{"hosting":{"site":"%s","public":"."}}\n' "$SITE" > "$RUNNER_TEMP/fb/firebase.json"
+
       - name: Promote
         if: ${{ inputs.stage == 'promote' }}
+        working-directory: ${{ runner.temp }}/fb
         run: |
           firebase hosting:channel:list --site "$SITE" --json --project "$PROJECT" > "$RUNNER_TEMP/channels.json"
           if grep -q "/channels/before-$CHANNEL\"" "$RUNNER_TEMP/channels.json"; then
@@ -119,4 +127,5 @@ jobs:
 
       - name: Roll back
         if: ${{ inputs.stage == 'rollback' }}
+        working-directory: ${{ runner.temp }}/fb
         run: firebase hosting:clone "$SITE:before-$CHANNEL" "$SITE:live" --project "$PROJECT"
