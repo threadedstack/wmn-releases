@@ -7,6 +7,10 @@
 #              editor-staging, which the release reads for its live check
 #   promote  - keeps the live version as the channel before-release-v<X-Y-Z> (the first copy only), then makes the preview live
 #   rollback - puts that kept version live again
+# The Present site (https://present.threadedstack.com, Hosting site wmn-present-app of the same project), which the editor shows presented pages
+# from, goes beside it when the release uploaded wmn-present-site-<version>.tar.gz: its preview channel is deployed first and its address is
+# written into the editor's api/present ("preview"), so the editor's preview presents through the Present site's preview; promote and rollback
+# move both sites. A release without that archive deploys the editor alone, as before.
 # Firebase sign-in is keyless (Workload Identity Federation, as in the site repositories' Deploy workflows): pool "github" accepts
 # threadedstack repositories, and gh-actions-deploy@wmn-runbooks needs the workloadIdentityUser binding for this repository.
 name: Hosted editor
@@ -33,6 +37,7 @@ concurrency:
 
 env:
   SITE: wmn-editor-app
+  PRESENT_SITE: wmn-present-app
   PROJECT: wmn-runbooks
   STAGING: editor-staging
 
@@ -59,6 +64,14 @@ jobs:
           gh release download "$STAGING" --repo "$GITHUB_REPOSITORY" --pattern "wmn-editor-site-$V.tar.gz" --pattern "wmn-editor-site-$V.tar.gz.sha256" --clobber
           shasum -a 256 -c "wmn-editor-site-$V.tar.gz.sha256"
           tar -xzf "wmn-editor-site-$V.tar.gz" -C "$RUNNER_TEMP/site"
+          if gh release download "$STAGING" --repo "$GITHUB_REPOSITORY" --pattern "wmn-present-site-$V.tar.gz" --pattern "wmn-present-site-$V.tar.gz.sha256" --clobber; then
+            shasum -a 256 -c "wmn-present-site-$V.tar.gz.sha256"
+            mkdir -p "$RUNNER_TEMP/present"
+            tar -xzf "wmn-present-site-$V.tar.gz" -C "$RUNNER_TEMP/present"
+            echo "HAS_PRESENT=1" >> "$GITHUB_ENV"
+          else
+            echo "this release has no Present site: the editor is deployed alone"
+          fi
 
       - uses: google-github-actions/auth@v2
         with:
@@ -72,7 +85,8 @@ jobs:
         working-directory: ${{ runner.temp }}/site
         run: |
           # the site's channels are capped (50): only the 2 newest versions' release and before- channels stay, and this version's own
-          firebase hosting:channel:list --site "$SITE" --json --project "$PROJECT" > "$RUNNER_TEMP/channels.json"
+          for site in "$SITE" ${HAS_PRESENT:+"$PRESENT_SITE"}; do
+          firebase hosting:channel:list --site "$site" --json --project "$PROJECT" > "$RUNNER_TEMP/channels.json"
           node -e '
             const fs = require("fs");
             const text = fs.readFileSync(process.env.RUNNER_TEMP + "/channels.json", "utf8");
@@ -85,9 +99,29 @@ jobs:
             console.log(names.filter((n) => ver(n) && !kept.has(key(ver(n)))).join("\n"));
           ' > "$RUNNER_TEMP/drop.txt"
           while read -r id; do
-            [ -n "$id" ] && firebase hosting:channel:delete "$id" --site "$SITE" --force --project "$PROJECT"
+            [ -n "$id" ] && firebase hosting:channel:delete "$id" --site "$site" --force --project "$PROJECT"
           done < "$RUNNER_TEMP/drop.txt"
+          done
           exit 0
+
+      - name: Deploy the Present site's preview channel (preview)
+        if: ${{ inputs.stage == 'preview' && env.HAS_PRESENT == '1' }}
+        working-directory: ${{ runner.temp }}/present
+        run: |
+          firebase hosting:channel:deploy "$CHANNEL" --only "$PRESENT_SITE" --expires 7d --json --project "$PROJECT" > "$RUNNER_TEMP/present-deploy.json"
+          cat "$RUNNER_TEMP/present-deploy.json"
+          node -e '
+            const fs = require("fs");
+            const t = fs.readFileSync(process.env.RUNNER_TEMP + "/present-deploy.json", "utf8");
+            const j = JSON.parse(t.slice(t.indexOf("{"), t.lastIndexOf("}") + 1));
+            const url = j.result?.[process.env.PRESENT_SITE]?.url;
+            if (!url) { console.error("the Present site channel deploy printed no url"); process.exit(1); }
+            const p = process.env.RUNNER_TEMP + "/site/api/present";
+            const c = JSON.parse(fs.readFileSync(p, "utf8"));
+            c.preview = new URL(url).origin;
+            fs.writeFileSync(p, JSON.stringify(c) + "\n");
+            console.log("the editor preview presents through " + c.preview);
+          '
 
       - name: Deploy the preview channel
         if: ${{ inputs.stage == 'preview' }}
@@ -124,8 +158,21 @@ jobs:
             firebase hosting:clone "$SITE:live" "$SITE:before-$CHANNEL" --project "$PROJECT"
           fi
           firebase hosting:clone "$SITE:$CHANNEL" "$SITE:live" --project "$PROJECT"
+          # the Present site of the same release, when it has one (a release before it had none)
+          firebase hosting:channel:list --site "$PRESENT_SITE" --json --project "$PROJECT" > "$RUNNER_TEMP/present-channels.json"
+          if grep -q "/channels/$CHANNEL\"" "$RUNNER_TEMP/present-channels.json"; then
+            if ! grep -q "/channels/before-$CHANNEL\"" "$RUNNER_TEMP/present-channels.json"; then
+              firebase hosting:clone "$PRESENT_SITE:live" "$PRESENT_SITE:before-$CHANNEL" --project "$PROJECT"
+            fi
+            firebase hosting:clone "$PRESENT_SITE:$CHANNEL" "$PRESENT_SITE:live" --project "$PROJECT"
+          fi
 
       - name: Roll back
         if: ${{ inputs.stage == 'rollback' }}
         working-directory: ${{ runner.temp }}/fb
-        run: firebase hosting:clone "$SITE:before-$CHANNEL" "$SITE:live" --project "$PROJECT"
+        run: |
+          firebase hosting:clone "$SITE:before-$CHANNEL" "$SITE:live" --project "$PROJECT"
+          firebase hosting:channel:list --site "$PRESENT_SITE" --json --project "$PROJECT" > "$RUNNER_TEMP/present-channels.json"
+          if grep -q "/channels/before-$CHANNEL\"" "$RUNNER_TEMP/present-channels.json"; then
+            firebase hosting:clone "$PRESENT_SITE:before-$CHANNEL" "$PRESENT_SITE:live" --project "$PROJECT"
+          fi
