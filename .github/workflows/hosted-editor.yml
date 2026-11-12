@@ -8,9 +8,9 @@
 #   promote  - keeps the live version as the channel before-release-v<X-Y-Z> (the first copy only), then makes the preview live
 #   rollback - puts that kept version live again
 # The Present site (https://present.threadedstack.com, Hosting site wmn-present-app of the same project), which the editor shows presented pages
-# from, goes beside it when the release uploaded wmn-present-site-<version>.tar.gz: its preview channel is deployed first and its address is
-# written into the editor's api/present ("preview"), so the editor's preview presents through the Present site's preview; promote and rollback
-# move both sites. A release without that archive deploys the editor alone, as before.
+# from, goes with it in every release (wmn-present-site-<version>.tar.gz), so the two always run the same version. Its preview channel is
+# deployed first and its address is written into the editor's api/present ("preview"), so the editor's preview presents through it. Promote
+# and rollback move both sites together: a failure on the second puts the first back.
 # Firebase sign-in is keyless (Workload Identity Federation, as in the site repositories' Deploy workflows): pool "github" accepts
 # threadedstack repositories, and gh-actions-deploy@wmn-runbooks needs the workloadIdentityUser binding for this repository.
 name: Hosted editor
@@ -64,14 +64,10 @@ jobs:
           gh release download "$STAGING" --repo "$GITHUB_REPOSITORY" --pattern "wmn-editor-site-$V.tar.gz" --pattern "wmn-editor-site-$V.tar.gz.sha256" --clobber
           shasum -a 256 -c "wmn-editor-site-$V.tar.gz.sha256"
           tar -xzf "wmn-editor-site-$V.tar.gz" -C "$RUNNER_TEMP/site"
-          if gh release download "$STAGING" --repo "$GITHUB_REPOSITORY" --pattern "wmn-present-site-$V.tar.gz" --pattern "wmn-present-site-$V.tar.gz.sha256" --clobber; then
-            shasum -a 256 -c "wmn-present-site-$V.tar.gz.sha256"
-            mkdir -p "$RUNNER_TEMP/present"
-            tar -xzf "wmn-present-site-$V.tar.gz" -C "$RUNNER_TEMP/present"
-            echo "HAS_PRESENT=1" >> "$GITHUB_ENV"
-          else
-            echo "this release has no Present site: the editor is deployed alone"
-          fi
+          gh release download "$STAGING" --repo "$GITHUB_REPOSITORY" --pattern "wmn-present-site-$V.tar.gz" --pattern "wmn-present-site-$V.tar.gz.sha256" --clobber
+          shasum -a 256 -c "wmn-present-site-$V.tar.gz.sha256"
+          mkdir -p "$RUNNER_TEMP/present"
+          tar -xzf "wmn-present-site-$V.tar.gz" -C "$RUNNER_TEMP/present"
 
       - uses: google-github-actions/auth@v2
         with:
@@ -84,8 +80,8 @@ jobs:
         if: ${{ inputs.stage == 'preview' }}
         working-directory: ${{ runner.temp }}/site
         run: |
-          # the site's channels are capped (50): only the 2 newest versions' release and before- channels stay, and this version's own
-          for site in "$SITE" ${HAS_PRESENT:+"$PRESENT_SITE"}; do
+          # each site's channels are capped (50): only the 2 newest versions' release and before- channels stay, and this version's own
+          for site in "$SITE" "$PRESENT_SITE"; do
           firebase hosting:channel:list --site "$site" --json --project "$PROJECT" > "$RUNNER_TEMP/channels.json"
           node -e '
             const fs = require("fs");
@@ -105,7 +101,7 @@ jobs:
           exit 0
 
       - name: Deploy the Present site's preview channel (preview)
-        if: ${{ inputs.stage == 'preview' && env.HAS_PRESENT == '1' }}
+        if: ${{ inputs.stage == 'preview' }}
         working-directory: ${{ runner.temp }}/present
         run: |
           firebase hosting:channel:deploy "$CHANNEL" --only "$PRESENT_SITE" --expires 7d --json --project "$PROJECT" > "$RUNNER_TEMP/present-deploy.json"
@@ -151,28 +147,33 @@ jobs:
         if: ${{ inputs.stage == 'promote' }}
         working-directory: ${{ runner.temp }}/fb
         run: |
-          firebase hosting:channel:list --site "$SITE" --json --project "$PROJECT" > "$RUNNER_TEMP/channels.json"
-          if grep -q "/channels/before-$CHANNEL\"" "$RUNNER_TEMP/channels.json"; then
-            echo "before-$CHANNEL is kept already"
-          else
-            firebase hosting:clone "$SITE:live" "$SITE:before-$CHANNEL" --project "$PROJECT"
-          fi
-          firebase hosting:clone "$SITE:$CHANNEL" "$SITE:live" --project "$PROJECT"
-          # the Present site of the same release, when it has one (a release before it had none)
-          firebase hosting:channel:list --site "$PRESENT_SITE" --json --project "$PROJECT" > "$RUNNER_TEMP/present-channels.json"
-          if grep -q "/channels/$CHANNEL\"" "$RUNNER_TEMP/present-channels.json"; then
-            if ! grep -q "/channels/before-$CHANNEL\"" "$RUNNER_TEMP/present-channels.json"; then
-              firebase hosting:clone "$PRESENT_SITE:live" "$PRESENT_SITE:before-$CHANNEL" --project "$PROJECT"
+          # both sites' preview channels must be there before either goes live
+          for site in "$SITE" "$PRESENT_SITE"; do
+            firebase hosting:channel:list --site "$site" --json --project "$PROJECT" > "$RUNNER_TEMP/channels-$site.json"
+            if ! grep -q "/channels/$CHANNEL\"" "$RUNNER_TEMP/channels-$site.json"; then echo "$site has no channel $CHANNEL" >&2; exit 1; fi
+          done
+          # what is live now is kept on each site, so a rollback (or a failure below) can put it back
+          for site in "$SITE" "$PRESENT_SITE"; do
+            if grep -q "/channels/before-$CHANNEL\"" "$RUNNER_TEMP/channels-$site.json"; then
+              echo "$site: before-$CHANNEL is kept already"
+            else
+              firebase hosting:clone "$site:live" "$site:before-$CHANNEL" --project "$PROJECT"
             fi
-            firebase hosting:clone "$PRESENT_SITE:$CHANNEL" "$PRESENT_SITE:live" --project "$PROJECT"
+          done
+          firebase hosting:clone "$PRESENT_SITE:$CHANNEL" "$PRESENT_SITE:live" --project "$PROJECT"
+          if ! firebase hosting:clone "$SITE:$CHANNEL" "$SITE:live" --project "$PROJECT"; then
+            echo "the editor did not go live: the Present site is put back so neither changed" >&2
+            firebase hosting:clone "$PRESENT_SITE:before-$CHANNEL" "$PRESENT_SITE:live" --project "$PROJECT"
+            exit 1
           fi
 
       - name: Roll back
         if: ${{ inputs.stage == 'rollback' }}
         working-directory: ${{ runner.temp }}/fb
         run: |
-          firebase hosting:clone "$SITE:before-$CHANNEL" "$SITE:live" --project "$PROJECT"
-          firebase hosting:channel:list --site "$PRESENT_SITE" --json --project "$PROJECT" > "$RUNNER_TEMP/present-channels.json"
-          if grep -q "/channels/before-$CHANNEL\"" "$RUNNER_TEMP/present-channels.json"; then
-            firebase hosting:clone "$PRESENT_SITE:before-$CHANNEL" "$PRESENT_SITE:live" --project "$PROJECT"
-          fi
+          # both sites go back; one that fails does not stop the other, and the step fails
+          failed=0
+          for site in "$SITE" "$PRESENT_SITE"; do
+            firebase hosting:clone "$site:before-$CHANNEL" "$site:live" --project "$PROJECT" || { echo "$site did not go back" >&2; failed=1; }
+          done
+          exit $failed
