@@ -1,0 +1,1206 @@
+# The automatic release of wmn (spec: GitHub release plan of 2026-11-18). Installed as .github/workflows/release.yml of
+# threadedstack/wmn-releases (public: free minutes, macOS too) by hand once and then by this file's own plan job (source:
+# release/release.yml of threadedstack/wmn; release/SETUP.md). It is modelled on the release workflow of wmd.
+#
+# A push to wmn's main starts it through wmn's release-trigger.yml (repository_dispatch wmn-push, payload {"sha"}), and that
+# run publishes. `gh workflow run release.yml -R threadedstack/wmn-releases -f sha=<full sha>` runs every build and check and
+# publishes nothing, and deletes its artifacts; `-f publish=true` publishes.
+#
+# plan first ends the run when the commit is already released (scripts/release.ts plan prints released=vX.Y.Z), then compares
+# the workflow files installed here (release.yml, hosted-editor.yml, wmd-follow.yml, manifests.yml) with release/ of the
+# commit. When they differ on a publishing run, plan installs the commit's files, sends the same event again and ends the run:
+# no build runs, and the run that event starts uses the commit's workflow with the commit's scripts. A dry run prints the
+# difference and goes on. plan also decides the version and what is reused: the engine folder of the last release when wmd and
+# the engine's inputs are unchanged.
+#
+# check (clean, guide, wmd-carry) and hostile (the hostile suites in three browsers, local and against the Linux wmd, for the
+# entries the changes since the last release reach; each browser's counts are its share of the Mac's, exact as there), hostile-mac (the
+# entries only a Mac runs: the Seatbelt sandbox), engine, mac (signed and notarized binary and app), linux and site start
+# together. preview deploys the editor and Present sites to a preview channel (release/hosted-editor.yml, called as a reusable
+# workflow), live-preview checks it in three browsers. publish runs only when all of them passed. Then homebrew, promote,
+# share, live-production (a failure rolls the editor back and sets RELEASE_AUTO to 0 in wmn) and records (pushes
+# `Release record: <version>` to main of wmn). on-failure opens an issue on threadedstack/wmn, starts release-heal.yml of wmn,
+# and deletes the run's artifacts except the ones a partial publish needs (see release/SETUP.md).
+#
+# One publishing run at a time (the concurrency group release); a newer push waits as a pending run, and every job before
+# publish first gives way to it (scripts/release-give-way.sh). A dry run has a concurrency group of its own.
+# Secrets and variables live in the environment `release` (release/SETUP.md); every job that reads one names it.
+# Third-party actions are pinned by commit (the tag in the comment). No step prints a secret or turns on shell tracing.
+name: release
+# release-give-way.sh reads "(publish)" at the end of the run name
+run-name: release ${{ github.event.client_payload.sha || inputs.sha }} (${{ (github.event_name == 'repository_dispatch' || inputs.publish) && 'publish' || 'dry run' }})
+
+on:
+  repository_dispatch:
+    types: [wmn-push]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: full commit sha of threadedstack/wmn
+        required: true
+        type: string
+      publish:
+        description: publish the release (GitHub release, Homebrew, hosted editor, share server)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: ${{ (github.event_name == 'repository_dispatch' || inputs.publish) && 'release' || format('release-dry-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+env:
+  SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+  RELEASE_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish }}
+  WMN_RELEASE_CI: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    environment: release
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      publish: ${{ steps.commit.outputs.publish }}
+      last_tag: ${{ steps.last.outputs.tag }}
+      # empty when there is no last release or its notes name no commit: everything is built and checked
+      last_commit: ${{ steps.last.outputs.commit }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      wmd_changed: ${{ steps.plan.outputs.wmd_changed }}
+      engine_changed: ${{ steps.plan.outputs.engine_changed }}
+      # 1 when the run builds: the workflows are the commit's and the commit is not released yet
+      go: ${{ steps.go.outputs.go }}
+    steps:
+      - name: the commit
+        id: commit
+        env:
+          PUBLISH: ${{ github.event_name == 'repository_dispatch' || inputs.publish }}
+        run: |
+          [[ $SHA =~ ^[0-9a-f]{40}$ ]] || { echo "the commit is not a full sha"; exit 1; }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          if [ "$PUBLISH" = true ]; then echo publish=1; else echo publish=0; fi >> "$GITHUB_OUTPUT"
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-contents: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmn
+          ref: ${{ steps.commit.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmn
+          fetch-depth: 0
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: wmn
+        run: bash scripts/release-give-way.sh
+      - name: the last release
+        id: last
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # wmn-releases is public: the run's own token lists it. released.txt has one `<tag> <commit>` line per release
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq '
+            .[] | select(.draft | not) | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))
+            | "\(.tag_name) \((.body // "") | capture("(^|\n)commit: (?<c>[0-9a-f]{40})") // {c: ""} | .c)"' > "$RUNNER_TEMP/released.txt"
+          tag=$(cut -d' ' -f1 "$RUNNER_TEMP/released.txt" | sort -V | tail -1)
+          commit=$(awk -v t="$tag" '$1 == t { print $2 }' "$RUNNER_TEMP/released.txt")
+          echo "last release: ${tag:-none} (commit ${commit:-unknown})"
+          { echo "tag=$tag"; echo "commit=$commit"; } >> "$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+        working-directory: wmn
+      # a commit that is already released ends the run here, before its older workflow files could be installed
+      - name: plan
+        id: plan
+        working-directory: wmn
+        env:
+          LAST_TAG: ${{ steps.last.outputs.tag }}
+          LAST_COMMIT: ${{ steps.last.outputs.commit }}
+        run: |
+          out=$(bun scripts/release.ts plan --last-tag "$LAST_TAG" --last-commit "$LAST_COMMIT" --sha "$SHA" --released "$RUNNER_TEMP/released.txt")
+          echo "$out"
+          if printf '%s\n' "$out" | grep -q '^released='; then
+            echo "${SHA:0:8} is already released as $(printf '%s\n' "$out" | sed -n 's/^released=//p'); nothing is built"
+            echo go=0 >> "$GITHUB_OUTPUT"
+          else
+            echo "$out" >> "$GITHUB_OUTPUT"
+            echo go=1 >> "$GITHUB_OUTPUT"
+          fi
+      - name: the workflow files
+        id: workflow
+        if: steps.plan.outputs.go == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ steps.commit.outputs.publish }}
+        run: |
+          # this run's workflow files against the commit's: the scripts come from the commit, so the two must match
+          : > "$RUNNER_TEMP/differ.txt"
+          for f in release hosted-editor wmd-follow manifests; do
+            if ! git -C wmn cat-file -e "$SHA:release/$f.yml" 2>/dev/null; then
+              echo "${SHA:0:8} has no release/$f.yml; the installed one stays"
+              continue
+            fi
+            git -C wmn show "$SHA:release/$f.yml" > "$RUNNER_TEMP/commit-$f.yml"
+            gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/$f.yml?ref=$GITHUB_WORKFLOW_SHA" \
+              -H 'Accept: application/vnd.github.raw' > "$RUNNER_TEMP/running-$f.yml" 2>/dev/null || : > "$RUNNER_TEMP/running-$f.yml"
+            if cmp -s "$RUNNER_TEMP/running-$f.yml" "$RUNNER_TEMP/commit-$f.yml"; then
+              echo "$f.yml of this run is release/$f.yml of ${SHA:0:8}"
+            else
+              echo "$f.yml of this run ($GITHUB_REPOSITORY at ${GITHUB_WORKFLOW_SHA:0:8}) differs from release/$f.yml of ${SHA:0:8}:"
+              diff -u "$RUNNER_TEMP/running-$f.yml" "$RUNNER_TEMP/commit-$f.yml" || true
+              echo "$f" >> "$RUNNER_TEMP/differ.txt"
+            fi
+          done
+          if [ ! -s "$RUNNER_TEMP/differ.txt" ]; then
+            echo current=1 >> "$GITHUB_OUTPUT"
+          elif [ "$PUBLISH" = 1 ]; then
+            echo "installing the commit's workflow files and sending this event again; this run builds nothing"
+            echo current=0 >> "$GITHUB_OUTPUT"
+          else
+            echo "a dry run goes on with this run's workflow files"
+            echo current=1 >> "$GITHUB_OUTPUT"
+          fi
+      - id: releases-token
+        if: steps.workflow.outputs.current == '0'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn-releases
+          permission-contents: write
+          permission-workflows: write
+      - name: install the commit's workflow files
+        if: steps.workflow.outputs.current == '0'
+        env:
+          GH_TOKEN: ${{ steps.releases-token.outputs.token }}
+        run: |
+          while read -r f; do
+            path=.github/workflows/$f.yml
+            want=$RUNNER_TEMP/commit-$f.yml
+            blob=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=main" --jq .sha 2>/dev/null) || blob=""
+            if [ "$(git hash-object "$want")" = "$blob" ]; then
+              echo "main of $GITHUB_REPOSITORY already has $f.yml"
+            else
+              jq -n --arg m "$f workflow of wmn ${SHA:0:8}" --arg c "$(base64 -w0 "$want")" --arg b "$blob" \
+                '{message: $m, content: $c, branch: "main"} + (if $b == "" then {} else {sha: $b} end)' |
+                gh api -X PUT "repos/$GITHUB_REPOSITORY/contents/$path" --input - --jq '"installed \(.content.path) as \(.commit.sha)"'
+            fi
+            # the run the event starts must see the same file, or it would install and send again
+            gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=main" -H 'Accept: application/vnd.github.raw' > "$RUNNER_TEMP/installed.yml"
+            cmp -s "$want" "$RUNNER_TEMP/installed.yml" ||
+              { echo "main of $GITHUB_REPOSITORY does not hold release/$f.yml of ${SHA:0:8}; nothing was sent"; exit 1; }
+          done < "$RUNNER_TEMP/differ.txt"
+      # a newer push installs the same way: this run never sends its event over a newer pending one
+      - name: give way to a newer run
+        if: steps.workflow.outputs.current == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: wmn
+        run: bash scripts/release-give-way.sh
+      - name: send the event again
+        if: steps.workflow.outputs.current == '0'
+        env:
+          GH_TOKEN: ${{ steps.releases-token.outputs.token }}
+          RUN_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = repository_dispatch ]; then
+            # the same event type and payload
+            jq -c '{event_type: .action, client_payload: .client_payload}' "$GITHUB_EVENT_PATH" |
+              gh api "repos/$GITHUB_REPOSITORY/dispatches" --input -
+          else
+            # a run by hand with publish: the same inputs (workflow_dispatch needs actions write, which the run's token has)
+            GH_TOKEN=$RUN_TOKEN gh workflow run release.yml -R "$GITHUB_REPOSITORY" --ref main -f sha="$SHA" -f publish=true
+          fi
+          echo "sent again: the next run builds ${SHA:0:8} with release/ of ${SHA:0:8}"
+      - name: the run goes on only with the commit's workflow files
+        id: go
+        if: always() && steps.plan.outputs.go == '1' && steps.workflow.outputs.current == '1'
+        run: echo "go=1" >> "$GITHUB_OUTPUT"
+
+  check:
+    needs: plan
+    if: needs.plan.outputs.go == '1'
+    runs-on: ubuntu-24.04
+    environment: release
+    defaults:
+      run:
+        working-directory: wmn
+    env:
+      WMN_RELEASE_CI: "1"
+      WMN_RELEASE_VERSION: ${{ needs.plan.outputs.tag }}
+      WMN_RELEASE_COMMIT: ${{ needs.plan.outputs.sha }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-contents: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmn
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmn
+          fetch-depth: 0
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/release-give-way.sh
+      - name: the release's folders
+        run: |
+          echo "WMN_RELEASE_OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          echo "WMN_ENGINE_DIR=$RUNNER_TEMP/out/engine" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: clean
+        run: bun scripts/release-check.ts --prereq clean
+      - name: guide
+        run: bun scripts/guide-check.ts
+      - name: wmd-carry (the wmd files from the installed packages)
+        run: bun scripts/release-check.ts --prereq wmd-carry
+
+  hostile:
+    needs: plan
+    if: needs.plan.outputs.go == '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+    runs-on: ubuntu-24.04
+    environment: release
+    defaults:
+      run:
+        working-directory: wmn
+    env:
+      WMN_RELEASE_CI: "1"
+      WMN_RELEASE_VERSION: ${{ needs.plan.outputs.tag }}
+      WMN_RELEASE_COMMIT: ${{ needs.plan.outputs.sha }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-contents: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmn
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmn
+          fetch-depth: 0
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/release-give-way.sh
+      - name: the release's folders
+        run: |
+          echo "WMN_RELEASE_OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          echo "WMN_ENGINE_DIR=$RUNNER_TEMP/out/engine" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      # the Go entry's preflight (scripts/hostile-suite.ts missingTools) wants python with matplotlib, node, ruby, R, julia, lua, perl, go
+      # and rust; a missing one fails the entry, it is never left out
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: wmn/agent/go.mod
+          cache-dependency-path: wmn/agent/go.sum
+      - uses: julia-actions/setup-julia@da908477b5db94c10ffce8cfea9f2b3b9d5db687 # v3.0.3
+        with:
+          version: "1"
+      - name: the interpreters the guest agent's tests start
+        working-directory: .
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3 python3-matplotlib ruby r-base-core lua5.4 perl
+          rustup toolchain install stable --profile minimal
+          for c in python3 node ruby Rscript julia lua5.4 perl go cargo; do command -v "$c" > /dev/null || { echo "missing: $c"; exit 1; }; done
+      # the real group (the Linux wmd, Chromium job only) boots machines: they need /dev/kvm
+      - name: let the machine use /dev/kvm
+        if: matrix.browser == 'chromium'
+        working-directory: .
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules > /dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -w /dev/kvm || { echo "/dev/kvm is not usable on this runner"; exit 1; }
+      - name: browsers for Playwright
+        run: bunx playwright install --with-deps ${{ matrix.browser }}
+      - name: hostile suites, local and against the Linux wmd (${{ matrix.browser }}), the entries the changes since the last release reach
+        env:
+          WMN_RELEASE_BROWSER: ${{ matrix.browser }}
+          WMN_RELEASE_SINCE: ${{ needs.plan.outputs.last_commit }}
+          TDSK_CLAUDE_CODE_API_KEY: ${{ secrets.TDSK_CLAUDE_CODE_API_KEY }}
+        run: bun scripts/hostile-release.ts
+      - name: keep the result folder
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hostile-${{ matrix.browser }}
+          path: ${{ runner.temp }}/out/hostile-${{ matrix.browser }}
+          retention-days: 1
+          if-no-files-found: warn
+
+  # the entries only a Mac can run (the Seatbelt sandbox of the ACP agent), when the changes since the last release reach them
+  hostile-mac:
+    needs: plan
+    if: needs.plan.outputs.go == '1'
+    runs-on: macos-15
+    environment: release
+    defaults:
+      run:
+        working-directory: wmn
+    env:
+      WMN_RELEASE_CI: "1"
+      WMN_RELEASE_VERSION: ${{ needs.plan.outputs.tag }}
+      WMN_RELEASE_COMMIT: ${{ needs.plan.outputs.sha }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-contents: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmn
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmn
+          fetch-depth: 0
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/release-give-way.sh
+      - name: the release's folders
+        run: |
+          echo "WMN_RELEASE_OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: hostile suites that need a Mac (macos-15), the entries the changes since the last release reach
+        env:
+          WMN_RELEASE_BROWSER: chromium
+          WMN_RELEASE_SINCE: ${{ needs.plan.outputs.last_commit }}
+        run: bun scripts/hostile-release.ts
+      - name: keep the result folder
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hostile-mac
+          path: ${{ runner.temp }}/out/hostile-chromium
+          retention-days: 1
+          if-no-files-found: warn
+
+  engine:
+    needs: plan
+    if: needs.plan.outputs.go == '1'
+    runs-on: ubuntu-24.04
+    environment: release
+    defaults:
+      run:
+        working-directory: wmn
+    env:
+      WMN_RELEASE_CI: "1"
+      WMN_RELEASE_VERSION: ${{ needs.plan.outputs.tag }}
+      WMN_RELEASE_COMMIT: ${{ needs.plan.outputs.sha }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-contents: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmn
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmn
+          fetch-depth: 0
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/release-give-way.sh
+      - name: the release's folders
+        run: |
+          echo "WMN_RELEASE_OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          echo "WMN_ENGINE_DIR=$RUNNER_TEMP/out/engine" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: let the machine use /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules > /dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: browsers for Playwright
+        run: bunx playwright install --with-deps chromium firefox webkit
+      - name: the engine folder of the last release
+        id: reuse
+        if: needs.plan.outputs.engine_changed == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LAST_TAG: ${{ needs.plan.outputs.last_tag }}
+        run: |
+          v=${LAST_TAG#v}
+          mkdir -p "$RUNNER_TEMP/last" "$WMN_ENGINE_DIR"
+          if gh release download "$LAST_TAG" -R "$GITHUB_REPOSITORY" -p "wmn-engine-$v.tar.gz" -p "wmn-engine-$v.tar.gz.sha256" -D "$RUNNER_TEMP/last" &&
+            (cd "$RUNNER_TEMP/last" && shasum -a 256 -c "wmn-engine-$v.tar.gz.sha256"); then
+            tar -xzf "$RUNNER_TEMP/last/wmn-engine-$v.tar.gz" -C "$WMN_ENGINE_DIR"
+            echo "the engine folder of $LAST_TAG is reused: wmd and the engine's inputs did not change"
+            echo build=0 >> "$GITHUB_OUTPUT"
+          else
+            echo "the engine folder of $LAST_TAG could not be taken; it is built"
+            echo build=1 >> "$GITHUB_OUTPUT"
+          fi
+      - name: build the engine folder (the Linux wmd-fixtures-gen and Playwright Chromium)
+        if: needs.plan.outputs.engine_changed == '1' || steps.reuse.outputs.build == '1'
+        run: bun scripts/web-engine.ts --out "$WMN_ENGINE_DIR" --base
+      - name: the engine folder was built for the installed wmd
+        run: bun scripts/release-check.ts --prereq engine --engine "$WMN_ENGINE_DIR"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: engine
+          path: ${{ runner.temp }}/out/engine
+          if-no-files-found: error
+          retention-days: 1
+
+  mac:
+    needs: [plan]
+    if: needs.plan.outputs.go == '1'
+    runs-on: macos-15
+    environment: release
+    defaults:
+      run:
+        working-directory: wmn
+    env:
+      WMN_RELEASE_CI: "1"
+      WMN_RELEASE_VERSION: ${{ needs.plan.outputs.tag }}
+      WMN_RELEASE_COMMIT: ${{ needs.plan.outputs.sha }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-contents: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmn
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmn
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/release-give-way.sh
+      - name: the release's folders
+        run: |
+          echo "WMN_RELEASE_OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          echo "WMN_ENGINE_DIR=$RUNNER_TEMP/out/engine" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      # the agent every build carries is built with the Go of agent/go.mod, as in the linux job
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: wmn/agent/go.mod
+          cache-dependency-path: wmn/agent/go.sum
+      - name: the signing keychain
+        env:
+          DEVID_P12: ${{ secrets.DEVID_P12 }}
+          DEVID_P12_PASSWORD: ${{ secrets.DEVID_P12_PASSWORD }}
+        run: bun scripts/ci-keychain.ts create
+      - name: the notary key
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: bun scripts/ci-secrets.ts notary-key
+      - name: the update key
+        env:
+          UPDATE_ED25519_PEM: ${{ secrets.UPDATE_ED25519_PEM }}
+        run: bun scripts/ci-secrets.ts update-key
+      - name: build the binary (darwin-arm64, signed)
+        run: bun scripts/release-steps.ts build-binary
+      - name: build the desktop app (signed)
+        run: bun scripts/release-steps.ts build-desktop
+      - name: notarize the app, the inner app and the binary, then staple and verify
+        run: bun scripts/release-steps.ts notarize
+      - name: delete the signing keychain
+        if: always()
+        run: bun scripts/ci-keychain.ts delete
+      - name: delete the secret files
+        if: always()
+        run: rm -rf "${RUNNER_TEMP:?}/wmn-ci-secrets"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mac
+          path: ${{ runner.temp }}/out
+          if-no-files-found: error
+          retention-days: 1
+
+  linux:
+    needs: [plan, engine]
+    if: needs.plan.outputs.go == '1'
+    runs-on: ubuntu-24.04
+    environment: release
+    defaults:
+      run:
+        working-directory: wmn
+    env:
+      WMN_RELEASE_CI: "1"
+      WMN_RELEASE_VERSION: ${{ needs.plan.outputs.tag }}
+      WMN_RELEASE_COMMIT: ${{ needs.plan.outputs.sha }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-contents: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmn
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmn
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/release-give-way.sh
+      - name: the release's folders
+        run: |
+          echo "WMN_RELEASE_OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          echo "WMN_ENGINE_DIR=$RUNNER_TEMP/out/engine" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: wmn/agent/go.mod
+          cache-dependency-path: wmn/agent/go.sum
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: engine
+          path: ${{ runner.temp }}/out/engine
+      - name: the update key
+        env:
+          UPDATE_ED25519_PEM: ${{ secrets.UPDATE_ED25519_PEM }}
+        run: bun scripts/ci-secrets.ts update-key
+      - name: the Linux binaries (x64 and arm64), the engine archive and the Go agents, each with its .sha256
+        run: bun scripts/release-steps.ts build-linux
+      - name: delete the secret files
+        if: always()
+        run: rm -rf "${RUNNER_TEMP:?}/wmn-ci-secrets"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux
+          path: ${{ runner.temp }}/out/site-files
+          if-no-files-found: error
+          retention-days: 1
+
+  site:
+    needs: [plan, engine]
+    if: needs.plan.outputs.go == '1'
+    runs-on: ubuntu-24.04
+    environment: release
+    defaults:
+      run:
+        working-directory: wmn
+    env:
+      WMN_RELEASE_CI: "1"
+      WMN_RELEASE_VERSION: ${{ needs.plan.outputs.tag }}
+      WMN_RELEASE_COMMIT: ${{ needs.plan.outputs.sha }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-contents: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmn
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmn
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/release-give-way.sh
+      - name: the release's folders
+        run: |
+          echo "WMN_RELEASE_OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          echo "WMN_ENGINE_DIR=$RUNNER_TEMP/out/engine" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: engine
+          path: ${{ runner.temp }}/out/engine
+      - name: build the editor and Present sites with the engine (the archives only; nothing is uploaded)
+        run: bun scripts/release-steps.ts hosted-preview
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: site
+          path: ${{ runner.temp }}/out/wmn-*-site-*
+          if-no-files-found: error
+          retention-days: 1
+
+  preview:
+    needs: [plan, site]
+    if: needs.plan.outputs.go == '1'
+    permissions:
+      contents: write
+      id-token: write
+    uses: ./.github/workflows/hosted-editor.yml
+    with:
+      version: ${{ needs.plan.outputs.version }}
+      stage: preview
+      site_artifact: site
+
+  live-preview:
+    needs: [plan, preview]
+    if: needs.plan.outputs.go == '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+    runs-on: ubuntu-24.04
+    environment: release
+    defaults:
+      run:
+        working-directory: wmn
+    env:
+      WMN_RELEASE_CI: "1"
+      WMN_RELEASE_VERSION: ${{ needs.plan.outputs.tag }}
+      WMN_RELEASE_COMMIT: ${{ needs.plan.outputs.sha }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-contents: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmn
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmn
+          persist-credentials: false
+      - name: give way to a newer run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/release-give-way.sh
+      - name: the release's folders
+        run: |
+          echo "WMN_RELEASE_OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          echo "WMN_ENGINE_DIR=$RUNNER_TEMP/out/engine" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: browsers for Playwright
+        run: bunx playwright install --with-deps chromium firefox webkit
+      - name: the live check on the preview (${{ matrix.browser }})
+        env:
+          PREVIEW_URL: ${{ needs.preview.outputs.preview_url }}
+          WMN_RELEASE_BROWSER: ${{ matrix.browser }}
+        run: |
+          printf '%s' "$PREVIEW_URL" > "$WMN_RELEASE_OUT/preview-url"
+          bun scripts/release-steps.ts live-check-preview
+
+  # a run by hand without publish: everything was built and checked; nothing is kept
+  discard:
+    needs: [plan, check, hostile, hostile-mac, mac, linux, live-preview]
+    if: ${{ always() && needs.plan.outputs.go == '1' && needs.plan.outputs.publish == '0' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: delete the run's artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate --jq '.artifacts[].id' |
+            while read -r id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"; done
+
+  publish:
+    needs: [plan, check, hostile, hostile-mac, engine, mac, linux, live-preview]
+    if: ${{ always() && needs.plan.outputs.go == '1' && needs.plan.outputs.publish == '1' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: macos-15
+    environment: release
+    defaults:
+      run:
+        working-directory: wmn
+    env:
+      WMN_RELEASE_CI: "1"
+      WMN_RELEASE_VERSION: ${{ needs.plan.outputs.tag }}
+      WMN_RELEASE_COMMIT: ${{ needs.plan.outputs.sha }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-contents: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmn
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmn
+          persist-credentials: false
+      - id: releases-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn-releases
+          permission-contents: write
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: the release's folders
+        run: |
+          echo "WMN_RELEASE_OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mac
+          path: ${{ runner.temp }}/out
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux
+          path: ${{ runner.temp }}/out/site-files
+      - name: the update key
+        env:
+          UPDATE_ED25519_PEM: ${{ secrets.UPDATE_ED25519_PEM }}
+        run: bun scripts/ci-secrets.ts update-key
+      - name: publish the release (the manifests signed, the GitHub release as latest)
+        env:
+          GH_TOKEN: ${{ steps.releases-token.outputs.token }}
+        run: bun scripts/release-steps.ts publish
+      - name: the Linux binaries, the Go agents and the engine on the release
+        env:
+          GH_TOKEN: ${{ steps.releases-token.outputs.token }}
+        run: bun scripts/release-steps.ts upload-site-files
+      - name: delete the secret files
+        if: always()
+        run: rm -rf "${RUNNER_TEMP:?}/wmn-ci-secrets"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/out/mac/release-assets
+          if-no-files-found: error
+          retention-days: 1
+
+  homebrew:
+    needs: [plan, publish]
+    if: needs.plan.outputs.go == '1' && needs.publish.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: release
+    defaults:
+      run:
+        working-directory: wmn
+    env:
+      WMN_RELEASE_CI: "1"
+      WMN_RELEASE_VERSION: ${{ needs.plan.outputs.tag }}
+      WMN_RELEASE_COMMIT: ${{ needs.plan.outputs.sha }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-contents: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmn
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmn
+          persist-credentials: false
+      - name: the release's folders
+        run: |
+          echo "WMN_RELEASE_OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          echo "WMN_ENGINE_DIR=$RUNNER_TEMP/out/engine" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/out/mac/release-assets
+      - id: tap-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: homebrew-wmn
+          permission-contents: write
+      - name: the tap
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+          TAP_TOKEN: ${{ steps.tap-token.outputs.token }}
+        run: |
+          git config --global user.name "wmn release"
+          git config --global user.email release@wmn.invalid
+          # git reads the token from the environment when it asks: no token in a file or a URL
+          git config --global credential.useHttpPath true
+          for u in https://github.com/threadedstack/homebrew-wmn https://github.com/threadedstack/homebrew-wmn.git; do
+            # shellcheck disable=SC2016
+            git config --global "credential.$u.helper" '!f() { test "$1" = get && echo username=x-access-token && echo "password=$TAP_TOKEN"; }; f'
+          done
+          bun scripts/release-steps.ts homebrew-tap
+
+  promote:
+    needs: [plan, homebrew]
+    if: needs.homebrew.result == 'success'
+    permissions:
+      contents: write
+      id-token: write
+    uses: ./.github/workflows/hosted-editor.yml
+    with:
+      version: ${{ needs.plan.outputs.version }}
+      stage: promote
+
+  live:
+    needs: [plan, promote]
+    if: needs.promote.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: release
+    defaults:
+      run:
+        working-directory: wmn
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-contents: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmn
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmn
+          persist-credentials: false
+      - name: the release's folders
+        run: |
+          echo "WMN_RELEASE_OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          echo "WMN_ENGINE_DIR=$RUNNER_TEMP/out/engine" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: wait until wmn.threadedstack.com serves the commit
+        run: bun scripts/release-wait-live.ts "$SHA"
+
+  share:
+    needs: [plan, live]
+    if: needs.live.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: release
+    defaults:
+      run:
+        working-directory: wmn
+    steps:
+      - name: install the version on the share server
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+          SHARE_HOST: ${{ vars.SHARE_HOST }}
+          SHARE_HOST_KEY: ${{ vars.SHARE_HOST_KEY }}
+          SHARE_SSH_KEY: ${{ secrets.SHARE_SSH_KEY }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          [ -n "$SHARE_HOST" ] && [ -n "$SHARE_HOST_KEY" ] && [ -n "$SHARE_SSH_KEY" ] ||
+            { echo "vars.SHARE_HOST, vars.SHARE_HOST_KEY and secrets.SHARE_SSH_KEY are needed to deploy the share server"; exit 1; }
+          key=$RUNNER_TEMP/share-key known=$RUNNER_TEMP/share-known-hosts
+          trap 'rm -f "$key" "$known"' EXIT
+          (umask 077 && printf '%s\n' "$SHARE_SSH_KEY" > "$key")
+          printf '%s\n' "$SHARE_HOST_KEY" > "$known"
+          ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$known" "wmn-deploy@$SHARE_HOST" "$TAG"
+
+  live-production:
+    needs: [plan, share]
+    if: needs.share.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+    runs-on: ubuntu-24.04
+    environment: release
+    defaults:
+      run:
+        working-directory: wmn
+    env:
+      WMN_RELEASE_CI: "1"
+      WMN_RELEASE_VERSION: ${{ needs.plan.outputs.tag }}
+      WMN_RELEASE_COMMIT: ${{ needs.plan.outputs.sha }}
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-contents: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmn
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.token.outputs.token }}
+          path: wmn
+          persist-credentials: false
+      - name: the release's folders
+        run: |
+          echo "WMN_RELEASE_OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          echo "WMN_ENGINE_DIR=$RUNNER_TEMP/out/engine" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: browsers for Playwright
+        run: bunx playwright install --with-deps chromium firefox webkit
+      - name: the live check on production (${{ matrix.browser }})
+        env:
+          WMN_RELEASE_BROWSER: ${{ matrix.browser }}
+        run: bun scripts/release-steps.ts live-check-production
+
+  # a failed live check on production puts the earlier editor back and stops the automatic releases until a person sets RELEASE_AUTO to 1
+  rollback:
+    needs: [plan, live-production]
+    if: ${{ always() && needs.live-production.result == 'failure' }}
+    permissions:
+      contents: write
+      id-token: write
+    uses: ./.github/workflows/hosted-editor.yml
+    with:
+      version: ${{ needs.plan.outputs.version }}
+      stage: rollback
+
+  halt:
+    needs: [live-production, rollback]
+    if: ${{ always() && needs.live-production.result == 'failure' }}
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-variables: write
+      - name: set RELEASE_AUTO to 0 in wmn
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: gh variable set RELEASE_AUTO --body 0 -R threadedstack/wmn
+
+  records:
+    needs: [plan, live-production]
+    if: ${{ always() && needs.live-production.result == 'success' }}
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-contents: write
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmn
+          ref: main
+          token: ${{ steps.token.outputs.token }}
+          path: wmn
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - name: write the records and push them to main of wmn
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          LAST_COMMIT: ${{ needs.plan.outputs.last_commit }}
+        working-directory: wmn
+        run: |
+          git config user.name "wmn release"
+          git config user.email release@wmn.invalid
+          bun scripts/release-ci-records.ts --repo . --version "$VERSION" --commit "$SHA" --previous "${LAST_COMMIT:-none}" --live chromium,firefox,webkit
+          git add deploys/releases.jsonl deploys/records.jsonl
+          git commit -m "Release record: $VERSION"
+          # main may have moved since the release started: put the record on top of it
+          for _ in 1 2 3 4 5; do
+            git push origin HEAD:main && exit 0
+            git pull --rebase origin main
+          done
+          echo "the release record was not pushed"; exit 1
+      - name: delete the run's artifacts
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate --jq '.artifacts[].id' |
+            while read -r id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"; done
+
+  on-failure:
+    needs: [plan, check, hostile, hostile-mac, engine, mac, linux, site, preview, live-preview, discard, publish, homebrew, promote, live, share, live-production, rollback, halt, records]
+    # cancelled(): a run that gave way still deletes its artifacts; only failed jobs open the issue
+    if: ${{ failure() || cancelled() }}
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - name: did publish start
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # a publish job that failed or was cancelled after it started (it has steps) may have published part of the release: its
+          # files are kept for release/SETUP.md's partial-publish steps, and so are they when the job list cannot be read
+          started=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate --jq '
+            .jobs[] | select(.name == "publish") | select(.conclusion == "failure" or .conclusion == "cancelled")
+            | select((.steps // []) | length > 0) | .name') || started=unknown
+          if [ -n "$started" ]; then echo keep=1; else echo keep=0; fi >> "$GITHUB_OUTPUT"
+      - id: token
+        if: env.RELEASE_DRY_RUN != 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-issues: write
+          permission-actions: write
+      - name: open or update the issue on threadedstack/wmn, and start the heal
+        id: issue
+        if: env.RELEASE_DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          RUN_TOKEN: ${{ github.token }}
+          KEEP: ${{ steps.publish.outputs.keep }}
+        run: |
+          # a job stopped only by giving way to a newer run is not a failure of the release
+          # shellcheck disable=SC2016
+          failed=$(GH_TOKEN=$RUN_TOKEN gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate --jq '
+            .jobs[] | select(.conclusion == "failure")
+            | [.steps[]? | select(.conclusion == "failure") | .name] as $s
+            | select($s != ["give way to a newer run"])
+            | "- \(.name): \(if ($s | length) > 0 then ($s | join(", ")) else "no step failed" end)"')
+          if [ -z "$failed" ]; then
+            echo "no job failed except by giving way to a newer run; no issue"
+            exit 0
+          fi
+          commit=$SHA; [[ $commit =~ ^[0-9a-f]{40}$ ]] || commit="(not a commit sha)"
+          short=${commit:0:8}; [[ $short =~ ^[0-9a-f]{8}$ ]] || short=unknown
+          title="release failed: $short"
+          run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body=$(printf 'commit: %s\nrun: %s\n\nfailed:\n%s\n' "$commit" "$run" "$failed")
+          if [ "$KEEP" = 1 ]; then
+            body=$(printf '%s\n\npublish failed after it started: the run keeps its mac, linux and release-assets artifacts for 1 day. See the partial publish steps in release/SETUP.md.\n' "$body")
+          fi
+          n=$(gh issue list -R threadedstack/wmn --state open --search "\"$title\" in:title" --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+          if [ -n "$n" ]; then
+            gh issue comment "$n" -R threadedstack/wmn --body "$body"
+          else
+            gh issue create -R threadedstack/wmn --title "$title" --body "$body"
+          fi
+          # the heal reads this run's logs and fixes the cause on main of wmn
+          gh workflow run release-heal.yml -R threadedstack/wmn --ref main -f run_id="$GITHUB_RUN_ID" -f sha="$commit" -f repo="$GITHUB_REPOSITORY"
+      - name: delete the run's artifacts
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: ${{ steps.publish.outputs.keep }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate --jq '.artifacts[] | "\(.id) \(.name)"' |
+            while read -r id name; do
+              if [ "$KEEP" = 1 ] && { [ "$name" = mac ] || [ "$name" = linux ] || [ "$name" = release-assets ]; }; then
+                echo "kept the $name artifact (publish failed after it started; it expires after 1 day)"
+                continue
+              fi
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
+            done

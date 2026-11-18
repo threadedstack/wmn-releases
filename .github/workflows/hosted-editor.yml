@@ -13,6 +13,11 @@
 # and rollback move both sites together: a failure on the second puts the first back.
 # Firebase sign-in is keyless (Workload Identity Federation, as in the site repositories' Deploy workflows): pool "github" accepts
 # threadedstack repositories, and gh-actions-deploy@wmn-runbooks needs the workloadIdentityUser binding for this repository.
+#
+# The release workflow (release.yml of this repository, source release/release.yml of wmn) calls this file as a reusable workflow
+# (workflow_call) with the same inputs, and with site_artifact: the name of an artifact of the calling run that holds the four
+# archives. The site then comes from that artifact, and the preview's address goes back as the output preview_url instead of to
+# editor-staging. Source: release/hosted-editor.yml of threadedstack/wmn (the release run installs it here with release.yml).
 name: Hosted editor
 
 on:
@@ -26,6 +31,25 @@ on:
         required: true
         type: choice
         options: [preview, promote, rollback]
+  workflow_call:
+    inputs:
+      version:
+        description: "wmn version (for example 0.1.84)"
+        required: true
+        type: string
+      stage:
+        description: "preview, promote or rollback"
+        required: true
+        type: string
+      site_artifact:
+        description: "an artifact of the calling run with the editor and Present archives (preview only); empty: editor-staging"
+        required: false
+        type: string
+        default: ""
+    outputs:
+      preview_url:
+        description: the preview channel's address (preview only)
+        value: ${{ jobs.deploy.outputs.preview_url }}
 
 permissions:
   contents: write
@@ -45,9 +69,12 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      preview_url: ${{ steps.preview.outputs.url }}
     env:
       GH_TOKEN: ${{ github.token }}
       VERSION: ${{ inputs.version }}
+      SITE_ARTIFACT: ${{ inputs.site_artifact }}
     steps:
       - name: Version and channel
         run: |
@@ -56,20 +83,32 @@ jobs:
           echo "V=$v" >> "$GITHUB_ENV"
           echo "CHANNEL=release-v${v//./-}" >> "$GITHUB_ENV"
 
-      - name: Download and check the site (preview)
-        if: ${{ inputs.stage == 'preview' }}
+      - name: The site from the calling run (preview)
+        if: ${{ inputs.stage == 'preview' && inputs.site_artifact != '' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.site_artifact }}
+          path: ${{ runner.temp }}/dl
+
+      - name: The site from editor-staging (preview)
+        if: ${{ inputs.stage == 'preview' && inputs.site_artifact == '' }}
         run: |
-          mkdir -p "$RUNNER_TEMP/dl" "$RUNNER_TEMP/site"
+          mkdir -p "$RUNNER_TEMP/dl"
           cd "$RUNNER_TEMP/dl"
           gh release download "$STAGING" --repo "$GITHUB_REPOSITORY" --pattern "wmn-editor-site-$V.tar.gz" --pattern "wmn-editor-site-$V.tar.gz.sha256" --clobber
+          gh release download "$STAGING" --repo "$GITHUB_REPOSITORY" --pattern "wmn-present-site-$V.tar.gz" --pattern "wmn-present-site-$V.tar.gz.sha256" --clobber
+
+      - name: Check the site (preview)
+        if: ${{ inputs.stage == 'preview' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/site" "$RUNNER_TEMP/present"
+          cd "$RUNNER_TEMP/dl"
           shasum -a 256 -c "wmn-editor-site-$V.tar.gz.sha256"
           tar -xzf "wmn-editor-site-$V.tar.gz" -C "$RUNNER_TEMP/site"
-          gh release download "$STAGING" --repo "$GITHUB_REPOSITORY" --pattern "wmn-present-site-$V.tar.gz" --pattern "wmn-present-site-$V.tar.gz.sha256" --clobber
           shasum -a 256 -c "wmn-present-site-$V.tar.gz.sha256"
-          mkdir -p "$RUNNER_TEMP/present"
           tar -xzf "wmn-present-site-$V.tar.gz" -C "$RUNNER_TEMP/present"
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           workload_identity_provider: projects/79296749603/locations/global/workloadIdentityPools/github/providers/github
           service_account: gh-actions-deploy@wmn-runbooks.iam.gserviceaccount.com
@@ -120,6 +159,7 @@ jobs:
           '
 
       - name: Deploy the preview channel
+        id: preview
         if: ${{ inputs.stage == 'preview' }}
         working-directory: ${{ runner.temp }}/site
         run: |
@@ -132,8 +172,12 @@ jobs:
             process.stdout.write(j.result?.[process.env.SITE]?.url ?? "");
           ')
           if [ -z "$url" ]; then echo "the preview channel deploy printed no url" >&2; exit 1; fi
-          printf '%s' "$url" > "$RUNNER_TEMP/editor-preview-url-$V.txt"
-          gh release upload "$STAGING" "$RUNNER_TEMP/editor-preview-url-$V.txt" --clobber --repo "$GITHUB_REPOSITORY"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          # a release run by hand from a Mac reads the address from editor-staging; a call from the release run takes the output
+          if [ -z "$SITE_ARTIFACT" ]; then
+            printf '%s' "$url" > "$RUNNER_TEMP/editor-preview-url-$V.txt"
+            gh release upload "$STAGING" "$RUNNER_TEMP/editor-preview-url-$V.txt" --clobber --repo "$GITHUB_REPOSITORY"
+          fi
           echo "preview: $url"
 
       - name: A Firebase folder (promote, rollback)
