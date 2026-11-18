@@ -43,6 +43,10 @@ on:
         description: publish the release (GitHub release, Homebrew, hosted editor, share server)
         type: boolean
         default: false
+      attempt:
+        description: how many times GitHub gave this commit's run no runner before (set by the run itself)
+        type: number
+        default: 0
 
 permissions:
   contents: read
@@ -344,9 +348,7 @@ jobs:
       - name: the interpreters the guest agent's tests start
         working-directory: .
         run: |
-          # apt gives up on a stalled mirror download after 30 s and tries again (the browser install below writes the same file)
-          printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "5";\nDPkg::Lock::Timeout "300";\n' |
-            sudo tee /etc/apt/apt.conf.d/99wmn-net > /dev/null
+          bash wmn/scripts/ci-apt.sh
           sudo apt-get update -qq
           sudo apt-get install -y -qq python3 python3-matplotlib ruby r-base-core lua5.4 perl
           rustup toolchain install stable --profile minimal
@@ -363,20 +365,10 @@ jobs:
           if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
           test -w /dev/kvm || { echo "/dev/kvm is not usable on this runner"; ls -l /dev/kvm; grep -cE 'vmx|svm' /proc/cpuinfo; exit 1; }
       - name: browsers for Playwright
-        # a hung apt or download stops after 10 minutes and is tried once more
-        timeout-minutes: 25
+        timeout-minutes: 20
         run: |
-          # apt gives up on a stalled mirror download after 30 s and tries again, and waits for a dpkg lock an earlier try still holds
-          if [ "$RUNNER_OS" = Linux ]; then
-            printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "5";\nDPkg::Lock::Timeout "300";\n' |
-              sudo tee /etc/apt/apt.conf.d/99wmn-net > /dev/null
-          fi
-          t=$(command -v timeout || command -v gtimeout || true)
-          for try in 1 2; do
-            ${t:+$t 600} bunx playwright install --with-deps ${{ matrix.browser }} && exit 0
-            echo "playwright install did not finish (try $try)"
-          done
-          exit 1
+          bash scripts/ci-apt.sh
+          bunx playwright install --with-deps ${{ matrix.browser }}
       - name: hostile suites, local and against the Linux wmd (${{ matrix.browser }}), the entries the changes since the last release reach
         env:
           WMN_RELEASE_BROWSER: ${{ matrix.browser }}
@@ -498,20 +490,10 @@ jobs:
           sudo udevadm settle
           if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
       - name: browsers for Playwright
-        # a hung apt or download stops after 10 minutes and is tried once more
-        timeout-minutes: 25
+        timeout-minutes: 20
         run: |
-          # apt gives up on a stalled mirror download after 30 s and tries again, and waits for a dpkg lock an earlier try still holds
-          if [ "$RUNNER_OS" = Linux ]; then
-            printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "5";\nDPkg::Lock::Timeout "300";\n' |
-              sudo tee /etc/apt/apt.conf.d/99wmn-net > /dev/null
-          fi
-          t=$(command -v timeout || command -v gtimeout || true)
-          for try in 1 2; do
-            ${t:+$t 600} bunx playwright install --with-deps chromium firefox webkit && exit 0
-            echo "playwright install did not finish (try $try)"
-          done
-          exit 1
+          bash scripts/ci-apt.sh
+          bunx playwright install --with-deps chromium firefox webkit
       - name: the engine folder of the last release
         id: reuse
         if: needs.plan.outputs.engine_changed == '0'
@@ -800,20 +782,10 @@ jobs:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - name: browsers for Playwright
-        # a hung apt or download stops after 10 minutes and is tried once more
-        timeout-minutes: 25
+        timeout-minutes: 20
         run: |
-          # apt gives up on a stalled mirror download after 30 s and tries again, and waits for a dpkg lock an earlier try still holds
-          if [ "$RUNNER_OS" = Linux ]; then
-            printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "5";\nDPkg::Lock::Timeout "300";\n' |
-              sudo tee /etc/apt/apt.conf.d/99wmn-net > /dev/null
-          fi
-          t=$(command -v timeout || command -v gtimeout || true)
-          for try in 1 2; do
-            ${t:+$t 600} bunx playwright install --with-deps ${{ matrix.browser }} && exit 0
-            echo "playwright install did not finish (try $try)"
-          done
-          exit 1
+          bash scripts/ci-apt.sh
+          bunx playwright install --with-deps ${{ matrix.browser }}
       - name: the live check on the preview (${{ matrix.browser }})
         env:
           PREVIEW_URL: ${{ needs.preview.outputs.preview_url }}
@@ -1089,20 +1061,10 @@ jobs:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - name: browsers for Playwright
-        # a hung apt or download stops after 10 minutes and is tried once more
-        timeout-minutes: 25
+        timeout-minutes: 20
         run: |
-          # apt gives up on a stalled mirror download after 30 s and tries again, and waits for a dpkg lock an earlier try still holds
-          if [ "$RUNNER_OS" = Linux ]; then
-            printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "5";\nDPkg::Lock::Timeout "300";\n' |
-              sudo tee /etc/apt/apt.conf.d/99wmn-net > /dev/null
-          fi
-          t=$(command -v timeout || command -v gtimeout || true)
-          for try in 1 2; do
-            ${t:+$t 600} bunx playwright install --with-deps ${{ matrix.browser }} && exit 0
-            echo "playwright install did not finish (try $try)"
-          done
-          exit 1
+          bash scripts/ci-apt.sh
+          bunx playwright install --with-deps ${{ matrix.browser }}
       - name: the live check on production (${{ matrix.browser }})
         env:
           WMN_RELEASE_BROWSER: ${{ matrix.browser }}
@@ -1205,8 +1167,47 @@ jobs:
             .jobs[] | select(.name == "publish") | select(.conclusion == "failure" or .conclusion == "cancelled")
             | select((.steps // []) | length > 0) | .name') || started=unknown
           if [ -n "$started" ]; then echo keep=1; else echo keep=0; fi >> "$GITHUB_OUTPUT"
+      - id: releases-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn-releases
+          permission-contents: write
+      # GitHub can have no macOS runner for a while ("not acquired by Runner"): nothing in wmn to heal, so the same event goes again
+      - name: a runner that never came, the same event again (twice at most)
+        id: runner
+        env:
+          GH_TOKEN: ${{ steps.releases-token.outputs.token }}
+          RUN_TOKEN: ${{ github.token }}
+          ATTEMPT: ${{ github.event.client_payload.attempt || inputs.attempt || 0 }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          # every job that failed or was cancelled never had a step, and GitHub's annotation on it says no runner took it
+          stopped=$(GH_TOKEN=$RUN_TOKEN gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate --jq '
+            .jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled") | "\(.id) \((.steps // []) | length)"')
+          [ -n "$stopped" ] || exit 0
+          while read -r id steps; do
+            [ "$steps" = 0 ] || exit 0
+            GH_TOKEN=$RUN_TOKEN gh api "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations" --jq '.[].message' |
+              grep -q "was not acquired by Runner" || exit 0
+          done <<< "$stopped"
+          if [ "$ATTEMPT" -ge 2 ]; then
+            echo "GitHub gave no runner the third time; the issue is opened"
+            exit 0
+          fi
+          next=$((ATTEMPT + 1))
+          echo "GitHub gave no runner to $(wc -l <<< "$stopped" | tr -d ' ') jobs; the same event again (attempt $next)"
+          if [ "$GITHUB_EVENT_NAME" = repository_dispatch ]; then
+            jq -c --argjson n "$next" '{event_type: .action, client_payload: (.client_payload + {attempt: $n})}' "$GITHUB_EVENT_PATH" |
+              gh api "repos/$GITHUB_REPOSITORY/dispatches" --input -
+          else
+            GH_TOKEN=$RUN_TOKEN gh workflow run release.yml -R "$GITHUB_REPOSITORY" --ref main -f sha="$SHA" -f publish="${PUBLISH:-false}" -f attempt="$next"
+          fi
+          echo "again=1" >> "$GITHUB_OUTPUT"
       - id: token
-        if: env.RELEASE_DRY_RUN != 'true'
+        if: env.RELEASE_DRY_RUN != 'true' && steps.runner.outputs.again != '1'
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
@@ -1217,7 +1218,7 @@ jobs:
           permission-actions: write
       - name: open or update the issue on threadedstack/wmn, and start the heal
         id: issue
-        if: env.RELEASE_DRY_RUN != 'true'
+        if: env.RELEASE_DRY_RUN != 'true' && steps.runner.outputs.again != '1'
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           RUN_TOKEN: ${{ github.token }}
