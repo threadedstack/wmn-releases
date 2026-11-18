@@ -797,7 +797,8 @@ jobs:
   # a run by hand without publish: everything was built and checked; nothing is kept
   discard:
     needs: [plan, check, hostile, hostile-mac, mac, linux, live-preview]
-    if: ${{ always() && needs.plan.outputs.go == '1' && needs.plan.outputs.publish == '0' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    # each job it needs succeeded: a job GitHub gave no runner reaches the jobs after it as neither failed nor cancelled
+    if: ${{ always() && needs.plan.outputs.go == '1' && needs.plan.outputs.publish == '0' && needs.check.result == 'success' && needs.hostile.result == 'success' && needs.hostile-mac.result == 'success' && needs.mac.result == 'success' && needs.linux.result == 'success' && needs.live-preview.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
       - name: delete the run's artifacts
@@ -809,7 +810,8 @@ jobs:
 
   publish:
     needs: [plan, check, hostile, hostile-mac, engine, mac, linux, live-preview]
-    if: ${{ always() && needs.plan.outputs.go == '1' && needs.plan.outputs.publish == '1' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    # each job it needs succeeded: a job GitHub gave no runner reaches the jobs after it as neither failed nor cancelled
+    if: ${{ always() && needs.plan.outputs.go == '1' && needs.plan.outputs.publish == '1' && needs.check.result == 'success' && needs.hostile.result == 'success' && needs.hostile-mac.result == 'success' && needs.engine.result == 'success' && needs.mac.result == 'success' && needs.linux.result == 'success' && needs.live-preview.result == 'success' }}
     runs-on: macos-15
     environment: release
     defaults:
@@ -1151,13 +1153,23 @@ jobs:
 
   on-failure:
     needs: [plan, check, hostile, hostile-mac, engine, mac, linux, site, preview, live-preview, discard, publish, homebrew, promote, live, share, live-production, rollback, halt, records]
-    # cancelled(): a run that gave way still deletes its artifacts; only failed jobs open the issue
-    if: ${{ failure() || cancelled() }}
+    # always, and its first step asks which jobs failed or stopped: a job GitHub gave no runner is not a failure() of the jobs after it.
+    # A run that gave way still deletes its artifacts; only failed jobs open the issue
+    if: always()
     runs-on: ubuntu-24.04
     environment: release
     steps:
+      - name: did a job fail or stop
+        id: look
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bad=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate --jq '
+            .jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled") | .name')
+          if [ -n "$bad" ]; then echo bad=1; else echo bad=0; fi >> "$GITHUB_OUTPUT"
       - name: did publish start
         id: publish
+        if: steps.look.outputs.bad == '1'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -1168,6 +1180,7 @@ jobs:
             | select((.steps // []) | length > 0) | .name') || started=unknown
           if [ -n "$started" ]; then echo keep=1; else echo keep=0; fi >> "$GITHUB_OUTPUT"
       - id: releases-token
+        if: steps.look.outputs.bad == '1'
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
@@ -1178,6 +1191,7 @@ jobs:
       # GitHub can have no macOS runner for a while ("not acquired by Runner"): nothing in wmn to heal, so the same event goes again
       - name: a runner that never came, the same event again (twice at most)
         id: runner
+        if: steps.look.outputs.bad == '1'
         env:
           GH_TOKEN: ${{ steps.releases-token.outputs.token }}
           RUN_TOKEN: ${{ github.token }}
@@ -1207,7 +1221,7 @@ jobs:
           fi
           echo "again=1" >> "$GITHUB_OUTPUT"
       - id: token
-        if: env.RELEASE_DRY_RUN != 'true' && steps.runner.outputs.again != '1'
+        if: env.RELEASE_DRY_RUN != 'true' && steps.look.outputs.bad == '1' && steps.runner.outputs.again != '1'
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
@@ -1218,7 +1232,7 @@ jobs:
           permission-actions: write
       - name: open or update the issue on threadedstack/wmn, and start the heal
         id: issue
-        if: env.RELEASE_DRY_RUN != 'true' && steps.runner.outputs.again != '1'
+        if: env.RELEASE_DRY_RUN != 'true' && steps.look.outputs.bad == '1' && steps.runner.outputs.again != '1'
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           RUN_TOKEN: ${{ github.token }}
@@ -1231,6 +1245,14 @@ jobs:
             | [.steps[]? | select(.conclusion == "failure") | .name] as $s
             | select($s != ["give way to a newer run"])
             | "- \(.name): \(if ($s | length) > 0 then ($s | join(", ")) else "no step failed" end)"')
+          # and the jobs GitHub gave no runner (the same event goes again only when they are all that stopped, twice at most)
+          norunner=$(GH_TOKEN=$RUN_TOKEN gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate --jq '
+            .jobs[] | select(.conclusion == "cancelled" and ((.steps // []) | length) == 0) | "\(.id) \(.name)"' |
+            while read -r id name; do
+              GH_TOKEN=$RUN_TOKEN gh api "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations" --jq '.[].message' |
+                grep -q "was not acquired by Runner" && echo "- $name: GitHub gave it no runner"
+            done) || true
+          failed=$(printf '%s\n%s\n' "$failed" "$norunner" | sed '/^$/d')
           if [ -z "$failed" ]; then
             echo "no job failed except by giving way to a newer run; no issue"
             exit 0
@@ -1253,7 +1275,7 @@ jobs:
           # the heal reads this run's logs and fixes the cause on main of wmn
           gh workflow run release-heal.yml -R threadedstack/wmn --ref main -f run_id="$GITHUB_RUN_ID" -f sha="$commit" -f repo="$GITHUB_REPOSITORY"
       - name: delete the run's artifacts
-        if: always()
+        if: always() && steps.look.outputs.bad == '1'
         env:
           GH_TOKEN: ${{ github.token }}
           KEEP: ${{ steps.publish.outputs.keep }}
