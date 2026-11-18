@@ -344,6 +344,9 @@ jobs:
       - name: the interpreters the guest agent's tests start
         working-directory: .
         run: |
+          # apt gives up on a stalled mirror download after 30 s and tries again (the browser install below writes the same file)
+          printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "5";\nDPkg::Lock::Timeout "300";\n' |
+            sudo tee /etc/apt/apt.conf.d/99wmn-net > /dev/null
           sudo apt-get update -qq
           sudo apt-get install -y -qq python3 python3-matplotlib ruby r-base-core lua5.4 perl
           rustup toolchain install stable --profile minimal
@@ -363,8 +366,14 @@ jobs:
         # a hung apt or download stops after 10 minutes and is tried once more
         timeout-minutes: 25
         run: |
+          # apt gives up on a stalled mirror download after 30 s and tries again, and waits for a dpkg lock an earlier try still holds
+          if [ "$RUNNER_OS" = Linux ]; then
+            printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "5";\nDPkg::Lock::Timeout "300";\n' |
+              sudo tee /etc/apt/apt.conf.d/99wmn-net > /dev/null
+          fi
+          t=$(command -v timeout || command -v gtimeout || true)
           for try in 1 2; do
-            timeout 600 bunx playwright install --with-deps ${{ matrix.browser }} && exit 0
+            ${t:+$t 600} bunx playwright install --with-deps ${{ matrix.browser }} && exit 0
             echo "playwright install did not finish (try $try)"
           done
           exit 1
@@ -492,8 +501,14 @@ jobs:
         # a hung apt or download stops after 10 minutes and is tried once more
         timeout-minutes: 25
         run: |
+          # apt gives up on a stalled mirror download after 30 s and tries again, and waits for a dpkg lock an earlier try still holds
+          if [ "$RUNNER_OS" = Linux ]; then
+            printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "5";\nDPkg::Lock::Timeout "300";\n' |
+              sudo tee /etc/apt/apt.conf.d/99wmn-net > /dev/null
+          fi
+          t=$(command -v timeout || command -v gtimeout || true)
           for try in 1 2; do
-            timeout 600 bunx playwright install --with-deps chromium firefox webkit && exit 0
+            ${t:+$t 600} bunx playwright install --with-deps chromium firefox webkit && exit 0
             echo "playwright install did not finish (try $try)"
           done
           exit 1
@@ -745,7 +760,8 @@ jobs:
       fail-fast: false
       matrix:
         browser: [chromium, firefox, webkit]
-    runs-on: ubuntu-24.04
+    # WebKit on a Mac, as the Mac release always checked it: the engine has not run in Linux WebKit (docs/OPEN.md)
+    runs-on: ${{ matrix.browser == 'webkit' && 'macos-15' || 'ubuntu-24.04' }}
     environment: release
     defaults:
       run:
@@ -787,8 +803,14 @@ jobs:
         # a hung apt or download stops after 10 minutes and is tried once more
         timeout-minutes: 25
         run: |
+          # apt gives up on a stalled mirror download after 30 s and tries again, and waits for a dpkg lock an earlier try still holds
+          if [ "$RUNNER_OS" = Linux ]; then
+            printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "5";\nDPkg::Lock::Timeout "300";\n' |
+              sudo tee /etc/apt/apt.conf.d/99wmn-net > /dev/null
+          fi
+          t=$(command -v timeout || command -v gtimeout || true)
           for try in 1 2; do
-            timeout 600 bunx playwright install --with-deps ${{ matrix.browser }} && exit 0
+            ${t:+$t 600} bunx playwright install --with-deps ${{ matrix.browser }} && exit 0
             echo "playwright install did not finish (try $try)"
           done
           exit 1
@@ -1031,7 +1053,8 @@ jobs:
       fail-fast: false
       matrix:
         browser: [chromium, firefox, webkit]
-    runs-on: ubuntu-24.04
+    # WebKit on a Mac, as the Mac release always checked it: the engine has not run in Linux WebKit (docs/OPEN.md)
+    runs-on: ${{ matrix.browser == 'webkit' && 'macos-15' || 'ubuntu-24.04' }}
     environment: release
     defaults:
       run:
@@ -1069,8 +1092,14 @@ jobs:
         # a hung apt or download stops after 10 minutes and is tried once more
         timeout-minutes: 25
         run: |
+          # apt gives up on a stalled mirror download after 30 s and tries again, and waits for a dpkg lock an earlier try still holds
+          if [ "$RUNNER_OS" = Linux ]; then
+            printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "5";\nDPkg::Lock::Timeout "300";\n' |
+              sudo tee /etc/apt/apt.conf.d/99wmn-net > /dev/null
+          fi
+          t=$(command -v timeout || command -v gtimeout || true)
           for try in 1 2; do
-            timeout 600 bunx playwright install --with-deps ${{ matrix.browser }} && exit 0
+            ${t:+$t 600} bunx playwright install --with-deps ${{ matrix.browser }} && exit 0
             echo "playwright install did not finish (try $try)"
           done
           exit 1
