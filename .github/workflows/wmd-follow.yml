@@ -106,6 +106,10 @@ jobs:
           fi
           git push origin "wmd/v$V"
           echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # a branch that pins the version already (a heal fixed it) skips `bun add`, so nothing else installs the packages
+      - name: install
+        if: steps.look.outputs.act == '1'
+        run: bun install --frozen-lockfile
       - name: typecheck
         if: steps.look.outputs.act == '1'
         run: bun run typecheck
