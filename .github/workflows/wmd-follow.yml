@@ -115,8 +115,10 @@ jobs:
         run: bun run typecheck
       - name: unit tests that import a wmd package
         if: steps.look.outputs.act == '1'
+        timeout-minutes: 20
         run: |
-          mapfile -t tests < <(bun scripts/wmd-follow.ts tests)
+          mapfile -t tests < <(bun scripts/wmd-follow.ts tests | sed '/^$/d')
+          if [ "${#tests[@]}" = 0 ]; then echo "no unit test imports a wmd package"; exit 0; fi
           printf '%s\n' "${tests[@]}"
           bun test "${tests[@]}"
       - name: browsers for Playwright
@@ -135,8 +137,10 @@ jobs:
         if: steps.look.outputs.act == '1'
         env:
           V: ${{ steps.look.outputs.version }}
+        # the walks of one wmd version take minutes; an hour means it ran more than those
+        timeout-minutes: 30
         run: |
-          mapfile -t walks < <(bun scripts/wmd-follow.ts walks --version "$V")
+          mapfile -t walks < <(bun scripts/wmd-follow.ts walks --version "$V" | sed '/^$/d')
           if [ "${#walks[@]}" = 0 ]; then echo "no walk is made for wmd $V"; exit 0; fi
           printf '%s\n' "${walks[@]}"
           bun e2e/run.ts --browsers chromium "${walks[@]}"
