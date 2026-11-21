@@ -6,6 +6,7 @@
 # tests that import a wmd package, the walks made for that wmd version, one engine build) and fast-forwards main to it. A failing check
 # opens the issue and starts release-heal.yml of wmn on the branch; once that heals the branch it closes the issue and starts this workflow
 # with the version, which then uses the branch that is there instead of making it again. The push to main starts the release through release-trigger.yml.
+# Its retry job starts a fresh publishing run of main's head when that release failed and nothing healed it (scripts/release-retry.ts).
 name: wmd follow
 
 on:
@@ -75,6 +76,13 @@ jobs:
           v=${tag#v}
           echo "wmd release: $tag"
           npm_has() { [ "$(npm view "$1@$v" version 2>/dev/null)" = "$v" ] && echo 1 || echo 0; }
+          # wmd publishes to npm about 20 minutes after its GitHub release, and the hourly schedule can come hours late,
+          # so a run that sees the release first waits for npm instead of stopping until a later run that may not come
+          for i in $(seq 1 30); do
+            [ "$(npm_has @threadedstack/wmd)" = 1 ] && [ "$(npm_has @threadedstack/wmd-web)" = 1 ] && break
+            echo "waiting for npm to have wmd $v ($i)"
+            sleep 60
+          done
           gh issue list -R threadedstack/wmn --state open --search 'wmd bump failed in:title' --limit 100 --json title --jq '.[].title' > "$RUNNER_TEMP/issues.txt"
           out=$(bun scripts/wmd-follow.ts decide --tag "$tag" --npm-wmd "$(npm_has @threadedstack/wmd)" --npm-web "$(npm_has @threadedstack/wmd-web)" \
             --package package.json --issues "$RUNNER_TEMP/issues.txt")
@@ -123,10 +131,8 @@ jobs:
           bun test "${tests[@]}"
       - name: browsers for Playwright
         if: steps.look.outputs.act == '1'
-        timeout-minutes: 20
-        run: |
-          bash scripts/ci-apt.sh
-          bunx playwright install --with-deps chromium
+        timeout-minutes: 65
+        run: bash scripts/ci-playwright.sh chromium
       - name: let the machine use /dev/kvm
         if: steps.look.outputs.act == '1'
         run: |
@@ -178,3 +184,69 @@ jobs:
           fi
           gh workflow run release-heal.yml -R threadedstack/wmn --ref main -f run_id="$GITHUB_RUN_ID" -f branch="wmd/v$V" \
             -f sha="$HEAD_SHA" -f repo="$GITHUB_REPOSITORY"
+
+  # A release of main's head that failed and was not healed by a push (a slow mirror, a runner that went away, a heal that could not run)
+  # is started again, fresh, by the hour: scripts/release-retry.ts decides (RELEASE_AUTO 1, nothing going, the failure 30 minutes old,
+  # at most 3 publishing runs of one commit). A fresh run, not a rerun: the failed run's artifacts keep one day.
+  retry:
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+    defaults:
+      run:
+        working-directory: wmn
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          owner: threadedstack
+          repositories: wmn
+          permission-contents: read
+          permission-actions: read
+          permission-variables: read
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: threadedstack/wmn
+          ref: main
+          token: ${{ steps.token.outputs.token }}
+          path: wmn
+          # every blob too: ships reads the files of both commits
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: does main's head need its release started again
+        id: look
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          RUN_TOKEN: ${{ github.token }}
+        run: |
+          head=$(git rev-parse HEAD)
+          auto=$(gh api repos/threadedstack/wmn/actions/variables/RELEASE_AUTO --jq .value) || auto=""
+          last=$(GH_TOKEN=$RUN_TOKEN gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .body | sed -n 's/^commit: \([0-9a-f]\{40\}\)$/\1/p' | head -1) || last=""
+          # exit 1 with its line is the only "nothing ships", as in release-trigger.yml
+          ships=1; rc=0
+          out=$(bun scripts/release.ts ships --from "$last" --to "$head") || rc=$?
+          if [ "$rc" = 1 ] && printf '%s\n' "$out" | grep -q '^no shipped file changed'; then ships=0; fi
+          GH_TOKEN=$RUN_TOKEN gh run list -R "$GITHUB_REPOSITORY" -w release.yml -L 100 --json displayTitle,status,conclusion,updatedAt > "$RUNNER_TEMP/runs.json"
+          heals=$(gh run list -R threadedstack/wmn -w release-heal.yml -L 20 --json status --jq '[.[] | select(.status != "completed")] | length') || heals=1
+          out=$(bun scripts/release-retry.ts decide --head "$head" --head-time "$(git log -1 --format=%cI HEAD)" --last "$last" \
+            --ships "$ships" --auto "$auto" --runs "$RUNNER_TEMP/runs.json" --heals "$heals")
+          echo "$out"
+          echo "$out" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+      - name: start a fresh publishing run of main's head
+        if: steps.look.outputs.retry == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.look.outputs.head }}
+        run: |
+          gh workflow run release.yml -R "$GITHUB_REPOSITORY" --ref main -f sha="$HEAD_SHA" -f publish=true
+          echo "started a publishing run of ${HEAD_SHA:0:8}"

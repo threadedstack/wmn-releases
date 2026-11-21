@@ -365,10 +365,8 @@ jobs:
           if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
           test -w /dev/kvm || { echo "/dev/kvm is not usable on this runner"; ls -l /dev/kvm; grep -cE 'vmx|svm' /proc/cpuinfo; exit 1; }
       - name: browsers for Playwright
-        timeout-minutes: 20
-        run: |
-          bash scripts/ci-apt.sh
-          bunx playwright install --with-deps ${{ matrix.browser }}
+        timeout-minutes: 65
+        run: bash scripts/ci-playwright.sh ${{ matrix.browser }}
       - name: hostile suites, local and against the Linux wmd (${{ matrix.browser }}), the entries the changes since the last release reach
         env:
           WMN_RELEASE_BROWSER: ${{ matrix.browser }}
@@ -490,10 +488,8 @@ jobs:
           sudo udevadm settle
           if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
       - name: browsers for Playwright
-        timeout-minutes: 20
-        run: |
-          bash scripts/ci-apt.sh
-          bunx playwright install --with-deps chromium firefox webkit
+        timeout-minutes: 65
+        run: bash scripts/ci-playwright.sh chromium firefox webkit
       - name: the engine folder of the last release
         id: reuse
         if: needs.plan.outputs.engine_changed == '0'
@@ -782,10 +778,8 @@ jobs:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - name: browsers for Playwright
-        timeout-minutes: 20
-        run: |
-          bash scripts/ci-apt.sh
-          bunx playwright install --with-deps ${{ matrix.browser }}
+        timeout-minutes: 65
+        run: bash scripts/ci-playwright.sh ${{ matrix.browser }}
       - name: the live check on the preview (${{ matrix.browser }})
         env:
           PREVIEW_URL: ${{ needs.preview.outputs.preview_url }}
@@ -1063,10 +1057,8 @@ jobs:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - name: browsers for Playwright
-        timeout-minutes: 20
-        run: |
-          bash scripts/ci-apt.sh
-          bunx playwright install --with-deps ${{ matrix.browser }}
+        timeout-minutes: 65
+        run: bash scripts/ci-playwright.sh ${{ matrix.browser }}
       - name: the live check on production (${{ matrix.browser }})
         env:
           WMN_RELEASE_BROWSER: ${{ matrix.browser }}
