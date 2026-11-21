@@ -208,7 +208,7 @@ jobs:
           repositories: wmn
           permission-contents: read
           permission-actions: read
-          permission-variables: read
+          permission-actions-variables: read
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: threadedstack/wmn

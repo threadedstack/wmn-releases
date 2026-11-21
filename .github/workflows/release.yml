@@ -1089,7 +1089,7 @@ jobs:
           private-key: ${{ secrets.RELEASE_APP_KEY }}
           owner: threadedstack
           repositories: wmn
-          permission-variables: write
+          permission-actions-variables: write
       - name: set RELEASE_AUTO to 0 in wmn
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
