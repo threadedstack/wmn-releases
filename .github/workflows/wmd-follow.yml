@@ -199,6 +199,8 @@ jobs:
           else
             gh issue create -R threadedstack/wmn --title "$title" --body "$body"
           fi
+          # a pin that failed pushed no branch (npm not serving the version yet): there is nothing to heal, the next follow tries again
+          if [ -z "$HEAD_SHA" ]; then echo "no wmd/v$V branch was pushed; the next follow run pins it again"; exit 0; fi
           gh workflow run release-heal.yml -R threadedstack/wmn --ref main -f run_id="$GITHUB_RUN_ID" -f branch="wmd/v$V" \
             -f sha="$HEAD_SHA" -f repo="$GITHUB_REPOSITORY"
 
