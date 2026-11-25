@@ -117,7 +117,15 @@ jobs:
           if [ "$(bun scripts/wmd-follow.ts pinned --version "$V" --package package.json)" = 1 ]; then
             echo "the branch pins wmd $V already"
           else
-            bun add --exact "@threadedstack/wmd@$V" "@threadedstack/wmd-web@$V"
+            # wmd's notice can come before npm serves the new version's binary packages (0.1.50's linux tarballs answered 404 for a
+            # minute): the add is tried again for up to ten minutes before the follow fails
+            for try in $(seq 1 20); do
+              if bun add --exact "@threadedstack/wmd@$V" "@threadedstack/wmd-web@$V"; then break; fi
+              [ "$try" = 20 ] && exit 1
+              echo "npm does not serve every package of wmd $V yet; trying again in 30 seconds"
+              git checkout -- package.json bun.lock
+              sleep 30
+            done
             git add package.json bun.lock
             git commit -m "wmd $V: pin @threadedstack/wmd and wmd-web"
           fi
@@ -191,6 +199,8 @@ jobs:
           else
             gh issue create -R threadedstack/wmn --title "$title" --body "$body"
           fi
+          # a pin that failed pushed no branch (npm not serving the version yet): there is nothing to heal, the next follow tries again
+          if [ -z "$HEAD_SHA" ]; then echo "no wmd/v$V branch was pushed; the next follow run pins it again"; exit 0; fi
           gh workflow run release-heal.yml -R threadedstack/wmn --ref main -f run_id="$GITHUB_RUN_ID" -f branch="wmd/v$V" \
             -f sha="$HEAD_SHA" -f repo="$GITHUB_REPOSITORY"
 
