@@ -16,6 +16,10 @@ on:
     - cron: "2,17,32,47 * * * *"
   repository_dispatch:
     types: [wmd-release]
+  # a finished release run: only the retry job runs (GitHub drops most runs of the schedule, so a failed release would wait hours)
+  workflow_run:
+    workflows: [release]
+    types: [completed]
   workflow_dispatch:
     inputs:
       version:
@@ -26,18 +30,19 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: wmd-follow
-  cancel-in-progress: false
-
 defaults:
   run:
     shell: bash
 
 jobs:
   follow:
+    if: github.event_name != 'workflow_run'
     runs-on: ubuntu-24.04
     environment: release
+    # one follow at a time; the retry job, which may wait half an hour, has a lock of its own
+    concurrency:
+      group: wmd-follow
+      cancel-in-progress: false
     defaults:
       run:
         working-directory: wmn
@@ -190,12 +195,19 @@ jobs:
             -f sha="$HEAD_SHA" -f repo="$GITHUB_REPOSITORY"
 
   # A release of main's head that failed and was not healed by a push (a slow mirror, a runner that went away, a heal that could not run)
-  # is started again, fresh, by the next run of this workflow: scripts/release-retry.ts decides (RELEASE_AUTO 1, nothing going, the failure 30 minutes old,
-  # at most 3 publishing runs of one commit). A fresh run, not a rerun: the failed run's artifacts keep one day.
+  # is started again, fresh: scripts/release-retry.ts decides (RELEASE_AUTO 1, nothing going, the failure 30 minutes old, at most 3 publishing
+  # runs of one commit). A failed publishing run starts this job by itself (workflow_run), which waits those 30 minutes so the heal goes
+  # first; the schedule is the fallback. A fresh run, not a rerun: the failed run's artifacts keep one day.
   retry:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'failure' && endsWith(github.event.workflow_run.display_title, '(publish)'))
     runs-on: ubuntu-24.04
     environment: release
-    timeout-minutes: 10
+    timeout-minutes: 45
+    concurrency:
+      group: release-retry
+      cancel-in-progress: false
     permissions:
       contents: read
       actions: write
@@ -203,6 +215,12 @@ jobs:
       run:
         working-directory: wmn
     steps:
+      # started by the failed run itself: the heal goes first (release-retry.ts waits 30 minutes after a failure); the token comes after,
+      # so it is fresh
+      - name: give the heal its 30 minutes
+        if: github.event_name == 'workflow_run'
+        working-directory: .
+        run: sleep 1860
       - id: token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
