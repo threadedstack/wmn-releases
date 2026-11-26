@@ -171,6 +171,8 @@ jobs:
               echo "$f" >> "$RUNNER_TEMP/differ.txt"
             fi
           done
+          # the list goes in an output too: the install step must not depend on a temp file surviving between steps
+          echo "differ=$(paste -sd' ' "$RUNNER_TEMP/differ.txt")" >> "$GITHUB_OUTPUT"
           if [ ! -s "$RUNNER_TEMP/differ.txt" ]; then
             echo current=1 >> "$GITHUB_OUTPUT"
           elif [ "$PUBLISH" = 1 ]; then
@@ -194,10 +196,12 @@ jobs:
         if: steps.workflow.outputs.current == '0'
         env:
           GH_TOKEN: ${{ steps.releases-token.outputs.token }}
+          DIFFER: ${{ steps.workflow.outputs.differ }}
         run: |
-          while read -r f; do
+          for f in $DIFFER; do
             path=.github/workflows/$f.yml
             want=$RUNNER_TEMP/commit-$f.yml
+            git -C wmn show "$SHA:release/$f.yml" > "$want"
             blob=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=main" --jq .sha 2>/dev/null) || blob=""
             if [ "$(git hash-object "$want")" = "$blob" ]; then
               echo "main of $GITHUB_REPOSITORY already has $f.yml"
@@ -210,7 +214,7 @@ jobs:
             gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=main" -H 'Accept: application/vnd.github.raw' > "$RUNNER_TEMP/installed.yml"
             cmp -s "$want" "$RUNNER_TEMP/installed.yml" ||
               { echo "main of $GITHUB_REPOSITORY does not hold release/$f.yml of ${SHA:0:8}; nothing was sent"; exit 1; }
-          done < "$RUNNER_TEMP/differ.txt"
+          done
       # a newer push installs the same way: this run never sends its event over a newer pending one
       - name: give way to a newer run
         if: steps.workflow.outputs.current == '0'
